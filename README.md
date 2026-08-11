@@ -2,6 +2,8 @@
 
 Motion-trail visualisation tool for tracking multiple objects in video — including well-defined objects (e.g. drones, vehicles, animals) and harder-to-see ones (e.g. a small payload). Uses background subtraction + Hungarian assignment to maintain object identities across frames, then renders clean trail videos.
 
+It also does **segmentation of static structure** — stairs, doorways, ramps — from robot recordings: see [Segmenting static structure](#segmenting-static-structure-stairs-doorways-ramps), which reads ROS 2 mcap bags directly and has a small desktop GUI.
+
 [debug video](https://github.com/user-attachments/assets/a0e2a55d-9e8b-4190-9f15-e77fb74a519f)
 
 [transient trails](https://github.com/user-attachments/assets/e33fe741-0fd7-465e-98d2-c9d5fde95972)
@@ -223,6 +225,94 @@ python src/to_webm.py
 
 Batch-converts all `output/*.mp4` → `output/webm/*.webm` using VP9. Useful for web embedding.
 
+## Segmenting static structure (stairs, doorways, ramps)
+
+Trails are for things that move. For structure that stays put while the camera
+moves, a trail would just encode your own egomotion — so this path renders a
+**per-frame segmentation overlay** and measures the subject's **orientation**
+instead.
+
+```
+mcap bags / video / photos ──▶ SAM 3 (text prompt) ──▶ masks ──┬──▶ overlay video
+                                                               └──▶ orientation JSON
+```
+
+### GUI
+
+```bash
+python src/gui.py
+```
+
+Pick a recording folder, press **Scan bag**, choose the camera topic, type what
+to look for (`stairs`), press **Run**. Needs Tk — `sudo apt install python3-tk`
+if the app reports it missing. Plain videos, single photos and folders of
+photos work too; those need no topic.
+
+### Command line
+
+```bash
+pip install -r requirements-mcap.txt
+
+# what cameras are in the bag?
+python src/stairs_pipeline.py --list /path/to/bags
+
+# run it
+python src/stairs_pipeline.py /path/to/bags \
+    --topic /camera/color/image_raw --prompt stairs --out output/stairs
+```
+
+Works the same on other inputs:
+
+```bash
+python src/stairs_pipeline.py clip.mp4 --prompt stairs
+python src/stairs_pipeline.py photo.jpg --prompt stairs
+python src/stairs_pipeline.py ./photos/ --prompt stairs
+```
+
+**Outputs** (`--out` stem):
+
+| File | Contents |
+|---|---|
+| `*_overlay.mp4` | frames with masks tinted and outlined, angle drawn and annotated |
+| `*_stairs.json` | per-frame angles, coverage, provenance, mcap timestamps |
+| `*_masks.npz` | RLE mask sidecar |
+
+### Reading mcap bags
+
+rosbag2 embeds message schemas in the file, so bags decode with **no ROS
+installation**. A recording split across `_0.mcap`, `_1.mcap`, … is read as one
+continuous stream, ordered by message timestamp rather than filename (plain
+sorting puts `_10` before `_9`). `sensor_msgs/msg/Image` and `CompressedImage`
+are both handled, across the encodings RealSense emits (`rgb8`, `bgr8`,
+`mono8`, `mono16`, YUV, Bayer).
+
+To try it without real data:
+
+```bash
+python tests/make_bag.py /tmp/fakebag --splits 3 --frames 30 --angle 25
+```
+
+### What the orientation number means
+
+`angle_deg` is the dominant edge direction **in the image plane**, in degrees,
+wrapped to `[0, 180)` because a line has no direction. It comes from Hough
+segments found inside the mask, length-weighted into an angle histogram.
+
+It is **not** the stairs' 3D orientation relative to the robot — that needs
+camera intrinsics plus either the nosing lines' vanishing point or the depth
+stream. The image-plane angle is directly useful for alignment ("is the robot
+square to the flight?") and is the input to that later 3D step.
+
+Every frame also carries a `confidence`: the share of detected edge length
+pointing the dominant way. A clean staircase reads ~1.0; competing directions
+(railings, floor tiles) pull it down, and frames with no consistent direction
+report `null` rather than a guess.
+
+**Visual odometry is not implemented.** Monocular VO needs intrinsics, feature
+tracking, essential-matrix decomposition, and still leaves scale ambiguous —
+it's a subsystem, not a flag. See the note at the end of this section if you
+want the cheap approximation.
+
 ## Source layout
 
 | File | Role |
@@ -236,6 +326,11 @@ Batch-converts all `output/*.mp4` → `output/webm/*.webm` using VP9. Useful for
 | `maskstore.py` | run-length mask sidecar |
 | `render.py` | trail videos |
 | `to_webm.py` | MP4 → WebM |
+| `gui.py` | desktop front end for the static-structure path |
+| `stairs_pipeline.py` | mcap/video/photos → masks → overlay + orientation |
+| `mcap_source.py` | ROS 2 mcap reading, no ROS install required |
+| `media.py` | normalises video / photo / photo folder / bags into one video |
+| `stair_orientation.py` | dominant edge angle from a mask |
 
 ## Configuration
 
