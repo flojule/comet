@@ -269,6 +269,28 @@ python src/stairs_pipeline.py photo.jpg --prompt stairs
 python src/stairs_pipeline.py ./photos/ --prompt stairs
 ```
 
+### Running the model on a different machine
+
+Only SAM 3 needs a GPU. The pipeline splits at that boundary, so the model can
+run on the CUDA box while everything else runs wherever you like:
+
+```bash
+# on the GPU machine
+python src/stairs_pipeline.py /path/to/bags \
+    --topic /camera/color/image_raw --prompt stairs \
+    --out output/stairs --stage segment
+
+# copy output/stairs_{stairs.json,masks.npz,frames.mp4} across, then anywhere:
+python src/stairs_pipeline.py --stage analyse --out output/stairs
+```
+
+Those three files are a complete handoff — the analyse stage never touches the
+bags, the model or CUDA. The masks are run-length encoded, so the bulk is just
+the frames video.
+
+This is worth using on a single machine too: retuning orientation costs seconds
+in the analyse stage instead of a full pass of the model.
+
 **Outputs** (`--out` stem):
 
 | File | Contents |
@@ -276,6 +298,18 @@ python src/stairs_pipeline.py ./photos/ --prompt stairs
 | `*_overlay.mp4` | frames with masks tinted and outlined, angle drawn and annotated |
 | `*_stairs.json` | per-frame angles, coverage, provenance, mcap timestamps |
 | `*_masks.npz` | RLE mask sidecar |
+| `*_frames.mp4` | the decoded frames, so the analyse stage can re-run standalone |
+
+### Hardware
+
+SAM 3 needs **CUDA**. The upstream package will not run on Apple Silicon — it
+calls `.cuda()` unconditionally, gates on `device.type == "cuda"`, and needs
+Triton kernels plus the `torch_generic_nms` CUDA extension
+([sam3#164](https://github.com/facebookresearch/sam3/issues/164)). `sam3_preflight.py`
+detects this and says so rather than reporting a missing GPU.
+
+Everything else — bag reading, orientation, overlay, the GUI, the test suite —
+needs no GPU and runs anywhere.
 
 ### Reading mcap bags
 
