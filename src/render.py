@@ -3,6 +3,7 @@
 Usage:
     python src/render.py                              # uses default data file
     python src/render.py output/crazyflo_path_tracking.json
+    python src/render.py output/crazyflo_sam3_tracking.json --mask-mode occlude
 
 Outputs (MP4, next to the JSON file):
     <stem>_persistent.mp4
@@ -10,16 +11,27 @@ Outputs (MP4, next to the JSON file):
 
 Any trail property can be overridden via the RENDER_* env vars or by editing
 the OVERRIDES dict at the top of this file.
+
+Mask modes (need a *_masks.npz sidecar, written by
+`track_sam3.py --save-masks`; ignored when there is none):
+
+    off       trails drawn straight over the frame, as before
+    occlude   trails pass BEHIND the objects — each object's own pixels are
+              restored on top of the trail canvas
+    glow      occlude, plus a coloured halo around each object's silhouette
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.signal import savgol_filter
+
+from maskstore import MaskStore, sidecar_path
+from trails import blend_trail, smooth_pts
 
 # ── Optional per-run overrides (None = use value from JSON) ────────────────────
 OVERRIDES: dict = {
@@ -32,28 +44,59 @@ OVERRIDES: dict = {
 
 DEFAULT_DATA_FILE = "output/crazyflo_path_tracking.json"
 
-
-# ── Rendering helpers (mirrors annotate.py) ────────────────────────────────────
-
-def smooth_pts(pts: list) -> list:
-    n = len(pts)
-    if n < 5:
-        return list(pts)
-    win = min(15, n if n % 2 == 1 else n - 1)
-    xs = savgol_filter([p[0] for p in pts], win, 3)
-    ys = savgol_filter([p[1] for p in pts], win, 3)
-    return [(int(x), int(y)) for x, y in zip(xs, ys)]
+GLOW_RADIUS = 9    # px — halo thickness in "glow" mode
+GLOW_ALPHA  = 0.7
 
 
-def blend_trail(frame: np.ndarray, canvas: np.ndarray, alpha: float) -> np.ndarray:
-    mask = canvas.any(axis=2)
-    out  = frame.copy()
-    out[mask] = cv2.addWeighted(frame, 1 - alpha, canvas, alpha, 0)[mask]
+def composite_masks(
+    base: np.ndarray,
+    blended: np.ndarray,
+    masks: dict[str, np.ndarray],
+    color: dict[str, tuple[int, int, int]],
+    mode: str,
+) -> np.ndarray:
+    """Put objects back in front of the trail canvas.
+
+    `blended` already has trails painted over `base`.  Restoring the original
+    pixels wherever an object's mask sits makes the trail read as passing behind
+    the object instead of being smeared across it.
+    """
+    if mode == "off" or not masks:
+        return blended
+
+    out = blended
+    if mode == "glow":
+        halo = np.zeros_like(base)
+        kern = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (GLOW_RADIUS * 2 + 1, GLOW_RADIUS * 2 + 1))
+        for name, m in masks.items():
+            u = m.astype(np.uint8)
+            ring = cv2.dilate(u, kern) & (1 - u)   # dilated minus the object
+            halo[ring.astype(bool)] = color.get(name, (255, 255, 255))
+        halo = cv2.GaussianBlur(halo, (0, 0), GLOW_RADIUS / 2.0)
+        out = blend_trail(out, halo, GLOW_ALPHA)
+
+    union = np.zeros(base.shape[:2], dtype=bool)
+    for m in masks.values():
+        union |= m
+    out = out.copy()
+    out[union] = base[union]
     return out
 
 
+def load_masks(data_file: str, want: bool) -> MaskStore | None:
+    if not want:
+        return None
+    p = sidecar_path(data_file)
+    if not p.exists():
+        print(f"  no mask sidecar at {p} — falling back to --mask-mode off")
+        return None
+    store = MaskStore.load(p)
+    print(f"  masks: {len(store)} from {p}")
+    return store
 
-def render(data_file: str = DEFAULT_DATA_FILE) -> None:
+
+def render(data_file: str = DEFAULT_DATA_FILE, mask_mode: str = "off") -> None:
     with open(data_file) as f:
         d = json.load(f)
 
@@ -104,6 +147,10 @@ def render(data_file: str = DEFAULT_DATA_FILE) -> None:
     fourcc = cv2.VideoWriter.fourcc(*"mp4v")
     head   = {name: 0 for name in trails}
 
+    store = load_masks(data_file, mask_mode != "off")
+    if store is None:
+        mask_mode = "off"
+
     cap = cv2.VideoCapture(video_in)
     if not cap.isOpened():
         sys.exit(f"Cannot open {video_in}")
@@ -130,6 +177,14 @@ def render(data_file: str = DEFAULT_DATA_FILE) -> None:
                 while head[name] < len(seq) and seq[head[name]][0] <= fi:
                     head[name] += 1
 
+        # Masks for this frame, if a sidecar is loaded.
+        frame_masks: dict[str, np.ndarray] = {}
+        if mask_mode != "off":
+            for name in trails:
+                m = store.get(fi, name)
+                if m is not None and m.shape == (H, W):
+                    frame_masks[name] = m
+
         # ── Persistent ────────────────────────────────────────────────────────
         if show_trail:
             cp = np.zeros((H, W, 3), dtype=np.uint8)
@@ -139,7 +194,9 @@ def render(data_file: str = DEFAULT_DATA_FILE) -> None:
                 if len(draw) >= 2:
                     cv2.polylines(cp, [np.array(draw, dtype=np.int32)],
                                   False, trail_color[name], thickness)
-            wr_p.write(blend_trail(frame, cp, alpha))
+            wr_p.write(composite_masks(
+                frame, blend_trail(frame, cp, alpha),
+                frame_masks, trail_color, mask_mode))
         else:
             wr_p.write(frame)
 
@@ -159,7 +216,9 @@ def render(data_file: str = DEFAULT_DATA_FILE) -> None:
                 col = tuple(int(c * w) for c in trail_color[name])
                 lw  = max(1, round(thickness * w ** 0.5))
                 cv2.line(ct, draw[k], draw[k + 1], col, lw)
-        wr_t.write(blend_trail(frame, ct, alpha))
+        wr_t.write(composite_masks(
+            frame, blend_trail(frame, ct, alpha),
+            frame_masks, trail_color, mask_mode))
 
         if fi % 30 == 0:
             sys.stdout.write(f"\r  {100*fi/total:.0f}%")
@@ -174,5 +233,17 @@ def render(data_file: str = DEFAULT_DATA_FILE) -> None:
     print(f"Done.\n  {out_p}\n  {out_t}")
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("data_file", nargs="?", default=DEFAULT_DATA_FILE)
+    p.add_argument("--mask-mode", choices=("off", "occlude", "glow"), default="off",
+                   help="use the *_masks.npz sidecar to composite objects over "
+                        "the trails (default: off)")
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
-    render(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATA_FILE)
+    _a = parse_args()
+    render(_a.data_file, _a.mask_mode)

@@ -1,0 +1,22 @@
+# Optional dependencies for the SAM 3 tracking backend (src/track_sam3.py).
+#
+# The base pipeline (pick.py / track.py / render.py / to_webm.py) does NOT need
+# any of this — install it only on the machine with the GPU.
+#
+# Requirements per the upstream README (https://github.com/facebookresearch/sam3):
+#   Python >= 3.12, PyTorch >= 2.7, CUDA >= 12.6
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install -r requirements-sam3.txt
+#   git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
+#
+# The SAM 3 checkpoints are gated: request access at
+# https://huggingface.co/facebook/sam3, then `huggingface-cli login`.
+#
+# Verify the whole setup with:
+#   python src/sam3_preflight.py
+
+torch>=2.7
+torchvision
+huggingface_hub
