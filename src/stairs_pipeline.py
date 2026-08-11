@@ -33,7 +33,7 @@ import numpy as np
 
 import stair_orientation as so
 from maskstore import MaskStore
-from media import Media, resolve
+from media import resolve
 from sam3_backend import (
     FrameWindow,
     Sam3Config,
@@ -66,9 +66,10 @@ def _color(i: int) -> tuple[int, int, int]:
     return MASK_COLORS[i % len(MASK_COLORS)]
 
 
-def render_overlay(
-    media: Media,
-    window: FrameWindow,
+def _render_overlay_frames(
+    frames: list,
+    start_frame: int,
+    fps: float,
     masks: MaskStore,
     id_to_name: dict[int, str],
     orientations: list[so.Orientation] | None,
@@ -76,12 +77,19 @@ def render_overlay(
     *,
     draw_orientation: bool = True,
 ) -> str | None:
-    """Tint each object's mask over the frame, and annotate the angle."""
+    """Tint each object's mask over the frame, and annotate the angle.
+
+    Takes decoded frames rather than a live FrameWindow, so this runs from the
+    stage-1 artifacts alone — no bag, no GPU, no re-extraction.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not frames:
+        logging.error("No frames to render")
+        return None
+    h, w = frames[0].shape[:2]
     writer = cv2.VideoWriter(
-        str(out_path), cv2.VideoWriter.fourcc(*"mp4v"), media.fps,
-        (window.width, window.height))
+        str(out_path), cv2.VideoWriter.fourcc(*"mp4v"), fps, (w, h))
     if not writer.isOpened():
         logging.error(f"Cannot open overlay video for writing: {out_path}")
         return None
@@ -89,11 +97,9 @@ def render_overlay(
     by_frame = {o.frame: o for o in (orientations or [])}
     names = list(id_to_name.values())
 
-    for local in range(window.n_frames):
-        abs_idx = window.to_absolute(local)
-        frame = window.read_frame(abs_idx)
-        if frame is None:
-            continue
+    for local, frame in enumerate(frames):
+        abs_idx = start_frame + local
+        frame = frame.copy()
 
         for i, name in enumerate(names):
             m = masks.get(abs_idx, name)
@@ -124,7 +130,7 @@ def render_overlay(
     return str(out_path)
 
 
-def run(
+def segment(
     source: str | Path,
     *,
     prompt: str = "stairs",
@@ -136,20 +142,22 @@ def run(
     checkpoint: str | None = None,
     min_score: float = 0.0,
     reprompt_every: int = 0,
-    orientation: bool = True,
-    overlay: bool = True,
-    orientation_cfg: so.OrientationConfig | None = None,
+    keep_video: bool = True,
     predictor=None,
     progress=None,
     log=print,
-) -> StairsResult:
-    """Full run.  `progress`/`log` are hooks so a GUI can follow along."""
+) -> dict:
+    """Stage 1 — run SAM 3 and persist masks.  THIS IS THE STAGE THAT NEEDS A GPU.
+
+    Writes `<stem>_masks.npz`, `<stem>_frames.mp4` and `<stem>_stairs.json`.
+    Those three files are a complete handoff: `analyse()` needs nothing else, so
+    the model can run on the GPU machine and everything downstream elsewhere.
+    """
     out_stem = Path(out_stem)
     out_stem.parent.mkdir(parents=True, exist_ok=True)
 
     log(f"Resolving input: {source}")
-    media = resolve(source, topic=topic, max_frames=max_frames,
-                    progress=progress)
+    media = resolve(source, topic=topic, max_frames=max_frames, progress=progress)
     window: FrameWindow | None = None
     try:
         log(f"  {media.kind}: {media.frames} frames "
@@ -201,41 +209,23 @@ def run(
             (log if cov >= 0.9 else
              (lambda m: log("WARNING: " + m)))(f"  {name}: seen in {100*cov:.0f}% of frames")
 
-        # ── Orientation ───────────────────────────────────────────────────────
-        ori: list[so.Orientation] = []
-        ori_summary: dict = {}
-        if orientation and id_to_name:
-            cfgo = orientation_cfg or so.OrientationConfig()
-            primary = _largest_object(results, id_to_name)
-            log(f"Measuring orientation of {primary!r} …")
-            for local in range(window.n_frames):
-                abs_idx = window.to_absolute(local)
-                frame = window.read_frame(abs_idx)
-                if frame is None:
-                    continue
-                ori.append(so.estimate_frame(
-                    frame, masks.get(abs_idx, primary), abs_idx, cfgo))
-            ori = so.smooth_series(ori, cfgo.smooth_window)
-            ori_summary = so.summarise(ori)
-            ori_summary["object"] = primary
-            if ori_summary.get("angle_deg_mean") is None:
-                log("  no dominant edge direction found in any frame")
-            else:
-                log(f"  mean angle {ori_summary['angle_deg_mean']:.1f}deg "
-                    f"(sd {ori_summary['angle_deg_std']:.1f}, "
-                    f"{100*ori_summary['coverage']:.0f}% of frames)")
-
-        # ── Outputs ───────────────────────────────────────────────────────────
-        overlay_path = None
-        if overlay and id_to_name:
-            overlay_path = render_overlay(
-                media, window, masks, id_to_name, ori,
-                out_stem.with_name(out_stem.name + "_overlay.mp4"))
-            if overlay_path:
-                log(f"Overlay → {overlay_path}")
+        # Area per object, so analyse() can pick the primary one without the
+        # per-frame observations, which are not part of the handoff.
+        areas: dict[str, float] = {}
+        for per_obj in results.values():
+            for oid, obs in per_obj.items():
+                n = id_to_name.get(oid)
+                if n:
+                    areas[n] = areas.get(n, 0.0) + obs.area
 
         mask_path = out_stem.with_name(out_stem.name + "_masks.npz")
         masks.save(mask_path)
+
+        frames_path = None
+        if keep_video:
+            frames_path = out_stem.with_name(out_stem.name + "_frames.mp4")
+            _persist_window(window, media.fps, frames_path)
+            log(f"Frames → {frames_path}")
 
         data = {
             "source": str(source),
@@ -251,8 +241,10 @@ def run(
             "frames": window.n_frames,
             "objects": {str(o): n for o, n in id_to_name.items()},
             "coverage": coverage,
-            "orientation": ori_summary,
+            "areas": areas,
+            "orientation": {},
             "masks": str(mask_path),
+            "frames_video": str(frames_path) if frames_path else None,
         }
         if media.kind == "mcap":
             data["timestamps_ns"] = media.detail.get("timestamps_ns", [])
@@ -261,32 +253,178 @@ def run(
         data_path.write_text(json.dumps(data, indent=2))
         log(f"Data → {data_path}")
         log(f"Masks → {mask_path}")
-
-        return StairsResult(
-            video=str(media.video), overlay=overlay_path, data=str(data_path),
-            frames=window.n_frames, objects=id_to_name, coverage=coverage,
-            orientation=ori_summary,
-        )
+        return data
     finally:
         if window is not None:
             window.cleanup()
         media.cleanup()
 
 
+def _persist_window(window: FrameWindow, fps: float, out: Path) -> None:
+    """Copy the extracted frames into an mp4 that outlives the temp dir."""
+    writer = cv2.VideoWriter(str(out), cv2.VideoWriter.fourcc(*"mp4v"), fps,
+                             (window.width, window.height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open {out} for writing")
+    for local in range(window.n_frames):
+        frame = window.read_frame(window.to_absolute(local))
+        if frame is not None:
+            writer.write(frame)
+    writer.release()
+
+
+def analyse(
+    out_stem: str | Path = "output/stairs",
+    *,
+    orientation: bool = True,
+    overlay: bool = True,
+    orientation_cfg: so.OrientationConfig | None = None,
+    frames_video: str | Path | None = None,
+    log=print,
+) -> StairsResult:
+    """Stage 2 — orientation and overlay from stage 1's output.  NO GPU NEEDED.
+
+    Re-runnable: retuning orientation costs seconds here rather than a full
+    pass of the model.
+    """
+    out_stem = Path(out_stem)
+    data_path = out_stem.with_name(out_stem.name + "_stairs.json")
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"{data_path} not found — run the segment stage first "
+            f"(python src/stairs_pipeline.py <source> --stage segment)"
+        )
+    data = json.loads(data_path.read_text())
+
+    mask_path = Path(data.get("masks") or
+                     out_stem.with_name(out_stem.name + "_masks.npz"))
+    if not mask_path.exists():
+        raise FileNotFoundError(f"Mask sidecar missing: {mask_path}")
+    masks = MaskStore.load(mask_path)
+
+    # Guard the unset case separately: Path("") is Path("."), which exists, so
+    # a bare exists() check would sail past a missing record and fail later
+    # with an unhelpful "cannot open ." from VideoCapture.
+    recorded = frames_video or data.get("frames_video")
+    if not recorded:
+        raise FileNotFoundError(
+            "No frames video recorded by the segment stage — re-run it with "
+            "--keep-video (the default), or point --frames-video at the clip."
+        )
+    video = Path(recorded)
+    if not video.exists():
+        raise FileNotFoundError(
+            f"Frames video missing: {video}. Copy it across from the machine "
+            f"that ran the segment stage, or pass --frames-video."
+        )
+
+    id_to_name = {int(k): v for k, v in data["objects"].items()}
+    start = int(data["start_frame"])
+    n_frames = int(data["frames"])
+    fps = float(data["fps"])
+
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open {video}")
+    frames: list = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames.append(f)
+    cap.release()
+    if len(frames) < n_frames:
+        log(f"WARNING: {video.name} has {len(frames)} frames, expected {n_frames}")
+        n_frames = len(frames)
+
+    ori: list[so.Orientation] = []
+    ori_summary: dict = {}
+    if orientation and id_to_name:
+        cfgo = orientation_cfg or so.OrientationConfig()
+        primary = _primary_from_areas(data.get("areas") or {}, id_to_name)
+        log(f"Measuring orientation of {primary!r} …")
+        for local in range(n_frames):
+            abs_idx = start + local
+            ori.append(so.estimate_frame(
+                frames[local], masks.get(abs_idx, primary), abs_idx, cfgo))
+        ori = so.smooth_series(ori, cfgo.smooth_window)
+        ori_summary = so.summarise(ori)
+        ori_summary["object"] = primary
+        if ori_summary.get("angle_deg_mean") is None:
+            log("  no dominant edge direction found in any frame")
+        else:
+            log(f"  mean angle {ori_summary['angle_deg_mean']:.1f}deg "
+                f"(sd {ori_summary['angle_deg_std']:.1f}, "
+                f"{100*ori_summary['coverage']:.0f}% of frames)")
+
+    overlay_path = None
+    if overlay and id_to_name:
+        overlay_path = _render_overlay_frames(
+            frames[:n_frames], start, fps, masks, id_to_name, ori,
+            out_stem.with_name(out_stem.name + "_overlay.mp4"))
+        if overlay_path:
+            log(f"Overlay → {overlay_path}")
+
+    data["orientation"] = ori_summary
+    data_path.write_text(json.dumps(data, indent=2))
+
+    return StairsResult(
+        video=str(video), overlay=overlay_path, data=str(data_path),
+        frames=n_frames, objects=id_to_name,
+        coverage=data.get("coverage", {}), orientation=ori_summary,
+    )
+
+
+def run(
+    source: str | Path,
+    *,
+    prompt: str = "stairs",
+    topic: str | None = None,
+    out_stem: str | Path = "output/stairs",
+    max_frames: int | None = None,
+    start_frame: int = 0,
+    end_frame: int | None = None,
+    checkpoint: str | None = None,
+    min_score: float = 0.0,
+    reprompt_every: int = 0,
+    orientation: bool = True,
+    overlay: bool = True,
+    orientation_cfg: so.OrientationConfig | None = None,
+    keep_video: bool = True,
+    predictor=None,
+    progress=None,
+    log=print,
+) -> StairsResult:
+    """Both stages back to back, for when one machine does everything."""
+    data = segment(
+        source, prompt=prompt, topic=topic, out_stem=out_stem,
+        max_frames=max_frames, start_frame=start_frame, end_frame=end_frame,
+        checkpoint=checkpoint, min_score=min_score,
+        reprompt_every=reprompt_every, keep_video=keep_video,
+        predictor=predictor, progress=progress, log=log,
+    )
+    if not data["objects"]:
+        # Nothing was found; there is nothing for stage 2 to measure or draw.
+        return StairsResult(
+            video=data.get("frames_video") or "", overlay=None,
+            data=str(Path(out_stem).with_name(Path(out_stem).name + "_stairs.json")),
+            frames=int(data["frames"]), objects={},
+            coverage=data.get("coverage", {}), orientation={},
+        )
+    return analyse(out_stem, orientation=orientation, overlay=overlay,
+                   orientation_cfg=orientation_cfg, log=log)
+
+
+def _primary_from_areas(areas: dict, id_to_name: dict[int, str]) -> str:
+    """Biggest object by accumulated mask area — the staircase, not a stray step."""
+    if areas:
+        return max(areas, key=areas.get)
+    return next(iter(id_to_name.values()))
+
+
 def _slug(text: str) -> str:
     keep = "".join(c if c.isalnum() else "_" for c in text.strip().lower())
     return keep.strip("_") or "obj"
-
-
-def _largest_object(results, id_to_name: dict[int, str]) -> str:
-    """The object with the most mask area — the staircase, not a stray step."""
-    totals: dict[int, float] = {}
-    for per_obj in results.values():
-        for oid, obs in per_obj.items():
-            totals[oid] = totals.get(oid, 0.0) + obs.area
-    if not totals:
-        return next(iter(id_to_name.values()))
-    return id_to_name[max(totals, key=totals.get)]
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -309,6 +447,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--reprompt-every", type=int, default=0)
     p.add_argument("--no-orientation", action="store_true")
     p.add_argument("--no-overlay", action="store_true")
+    p.add_argument("--stage", choices=("all", "segment", "analyse"), default="all",
+                   help="'segment' runs SAM 3 and needs a CUDA GPU; 'analyse' "
+                        "does orientation and overlay from its output and needs "
+                        "none, so the two can run on different machines "
+                        "(default: all)")
+    p.add_argument("--frames-video", default=None,
+                   help="override the frames mp4 the analyse stage reads")
+    p.add_argument("--no-keep-video", action="store_true",
+                   help="do not persist the frames mp4 (analyse then cannot run "
+                        "separately)")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -318,6 +466,12 @@ def main(args: argparse.Namespace | None = None) -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s")
+
+    # The analyse stage reads stage 1's artifacts, so it takes no source at all.
+    if args.stage == "analyse":
+        analyse(args.out, orientation=not args.no_orientation,
+                overlay=not args.no_overlay, frames_video=args.frames_video)
+        return 0
 
     if not args.source:
         print("Give a source. Try --help.")
@@ -334,11 +488,28 @@ def main(args: argparse.Namespace | None = None) -> int:
             print("  " + t.describe())
         return 0
 
+    if args.stage == "segment":
+        segment(args.source, prompt=args.prompt, topic=args.topic,
+                out_stem=args.out, max_frames=args.max_frames,
+                start_frame=args.start_frame, end_frame=args.end_frame,
+                checkpoint=args.checkpoint, min_score=args.min_score,
+                reprompt_every=args.reprompt_every,
+                keep_video=not args.no_keep_video)
+        print("\nSegment stage done. Copy these to wherever you want to analyse:")
+        stem = Path(args.out)
+        for suffix in ("_stairs.json", "_masks.npz", "_frames.mp4"):
+            p = stem.with_name(stem.name + suffix)
+            if p.exists():
+                print(f"  {p}  ({p.stat().st_size / 1e6:.1f} MB)")
+        print(f"\nThen: python src/stairs_pipeline.py --stage analyse --out {args.out}")
+        return 0
+
     run(args.source, prompt=args.prompt, topic=args.topic, out_stem=args.out,
         max_frames=args.max_frames, start_frame=args.start_frame,
         end_frame=args.end_frame, checkpoint=args.checkpoint,
         min_score=args.min_score, reprompt_every=args.reprompt_every,
-        orientation=not args.no_orientation, overlay=not args.no_overlay)
+        orientation=not args.no_orientation, overlay=not args.no_overlay,
+        keep_video=not args.no_keep_video)
     return 0
 
 

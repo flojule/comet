@@ -246,6 +246,129 @@ def _no_detections(fp):
     return handler
 
 
+class TestStageSplit(unittest.TestCase):
+    """The GPU boundary: segment needs CUDA, analyse does not."""
+
+    W, H = 160, 120
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.bags = self.dir / "bags"
+        make_split_recording(self.bags, splits=2, frames_per_split=6,
+                             w=self.W, h=self.H, angle_deg=35.0,
+                             extra_topics=False)
+        self.out = self.dir / "out" / "stairs"
+        self.fake = FakePredictor(height=self.H, width=self.W, radius=30,
+                                  velocity=(0.0, 0.0))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _segment(self, **kw):
+        with mock.patch.object(stairs_pipeline, "build_predictor",
+                               return_value=self.fake):
+            return stairs_pipeline.segment(
+                self.bags, topic=COLOR_TOPIC, prompt="stairs",
+                out_stem=self.out, log=lambda *_: None, **kw)
+
+    def test_segment_writes_a_complete_handoff(self):
+        self._segment()
+        for suffix in ("_stairs.json", "_masks.npz", "_frames.mp4"):
+            p = self.out.with_name(self.out.name + suffix)
+            self.assertTrue(p.exists(), suffix)
+
+    def test_segment_does_no_orientation_or_overlay(self):
+        data = self._segment()
+        self.assertEqual(data["orientation"], {})
+        self.assertFalse((self.out.with_name(self.out.name + "_overlay.mp4")).exists())
+
+    def test_analyse_runs_from_artifacts_alone(self):
+        self._segment()
+        # Deleting the bags proves analyse needs nothing but stage 1's output —
+        # this is what lets it run on a different machine.
+        import shutil
+        shutil.rmtree(self.bags)
+
+        res = stairs_pipeline.analyse(self.out, log=lambda *_: None)
+        self.assertTrue(Path(res.overlay).exists())
+        self.assertIsNotNone(res.orientation.get("angle_deg_mean"))
+
+    def test_analyse_needs_no_predictor_at_all(self):
+        self._segment()
+        # build_predictor raising proves stage 2 never touches the GPU path.
+        def explode(*a, **k):
+            raise AssertionError("analyse must not build a predictor")
+        with mock.patch.object(stairs_pipeline, "build_predictor", explode):
+            stairs_pipeline.analyse(self.out, log=lambda *_: None)
+
+    def test_split_matches_a_single_machine_run(self):
+        self._segment()
+        split = stairs_pipeline.analyse(self.out, log=lambda *_: None)
+
+        whole_stem = self.dir / "out2" / "stairs"
+        with mock.patch.object(stairs_pipeline, "build_predictor",
+                               return_value=self.fake):
+            whole = stairs_pipeline.run(
+                self.bags, topic=COLOR_TOPIC, prompt="stairs",
+                out_stem=whole_stem, log=lambda *_: None)
+        self.assertEqual(split.frames, whole.frames)
+        self.assertAlmostEqual(split.orientation["angle_deg_mean"],
+                               whole.orientation["angle_deg_mean"], delta=0.01)
+
+    def test_analyse_updates_the_json_in_place(self):
+        self._segment()
+        stairs_pipeline.analyse(self.out, log=lambda *_: None)
+        d = json.loads((self.out.with_name(self.out.name + "_stairs.json")).read_text())
+        self.assertIsNotNone(d["orientation"].get("angle_deg_mean"))
+
+    def test_analyse_is_rerunnable_with_new_settings(self):
+        # The point of the split: retuning orientation must not need the model.
+        self._segment()
+        import stair_orientation as so
+        a = stairs_pipeline.analyse(self.out, log=lambda *_: None)
+        b = stairs_pipeline.analyse(
+            self.out, log=lambda *_: None,
+            orientation_cfg=so.OrientationConfig(min_dominant_share=0.99))
+        self.assertIsNotNone(a.orientation.get("angle_deg_mean"))
+        self.assertLessEqual(b.orientation.get("coverage", 1.0),
+                             a.orientation.get("coverage", 1.0))
+
+    def test_analyse_without_segment_says_so(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            stairs_pipeline.analyse(self.dir / "never" / "ran")
+        self.assertIn("segment", str(ctx.exception))
+
+    def test_analyse_without_frames_video_says_so(self):
+        self._segment(keep_video=False)
+        with self.assertRaises(FileNotFoundError) as ctx:
+            stairs_pipeline.analyse(self.out, log=lambda *_: None)
+        self.assertIn("--keep-video", str(ctx.exception))
+
+    def test_missing_mask_sidecar_says_so(self):
+        self._segment()
+        (self.out.with_name(self.out.name + "_masks.npz")).unlink()
+        with self.assertRaises(FileNotFoundError) as ctx:
+            stairs_pipeline.analyse(self.out, log=lambda *_: None)
+        self.assertIn("Mask sidecar", str(ctx.exception))
+
+    def test_analyse_via_cli_needs_no_source_argument(self):
+        # The analyse stage runs where the bags are not, so requiring a source
+        # positional would defeat the whole point of the split.
+        self._segment()
+        code = stairs_pipeline.main(
+            stairs_pipeline.parse_args(["--stage", "analyse",
+                                        "--out", str(self.out)]))
+        self.assertEqual(code, 0)
+        self.assertTrue((self.out.with_name(self.out.name + "_overlay.mp4")).exists())
+
+    def test_stage_flags_parse(self):
+        a = stairs_pipeline.parse_args(["src", "--stage", "segment"])
+        self.assertEqual(a.stage, "segment")
+        b = stairs_pipeline.parse_args(["--stage", "analyse", "--out", "o"])
+        self.assertEqual((b.stage, b.out), ("analyse", "o"))
+
+
 class TestCli(unittest.TestCase):
     def test_list_topics_prints_them(self):
         with tempfile.TemporaryDirectory() as td:

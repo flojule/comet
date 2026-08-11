@@ -138,7 +138,7 @@ def resolve(
         if kind == "mcap":
             if not topic:
                 raise ValueError(
-                    "mcap input needs a topic — run `python src/mcap_extract.py "
+                    "mcap input needs a topic — run `python src/stairs_pipeline.py "
                     f"--list {src}` to see what is in the bag"
                 )
             from mcap_source import extract_to_video
