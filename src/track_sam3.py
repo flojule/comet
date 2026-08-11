@@ -75,7 +75,13 @@ LOG_FILE    = "track_sam3.log"
 
 # ── ROI loading ────────────────────────────────────────────────────────────────
 
-def load_rois(path: str) -> tuple[int, int | None, dict[str, list[int]]]:
+def load_rois(path: str, required: bool = True
+              ) -> tuple[int, int | None, dict[str, list[int]]]:
+    """Read rois.json.  In text mode the file is optional — a concept prompt
+    needs no seed boxes, so "point at a video and name the thing" must work
+    with no picking step at all."""
+    if not required and not Path(path).exists():
+        return 0, None, {}
     with open(path) as f:
         raw = json.load(f)
     if isinstance(raw, dict) and "rois" in raw:
@@ -325,7 +331,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         format="%(asctime)s %(levelname)s: %(message)s",
     )
 
-    start_frame, end_frame, rois = load_rois(args.rois)
+    start_frame, end_frame, rois = load_rois(args.rois, required=not args.text)
     if args.start_frame is not None:
         start_frame = args.start_frame
     if args.end_frame is not None:

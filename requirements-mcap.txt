@@ -1,0 +1,14 @@
+# Optional dependencies for reading ROS 2 mcap bags (src/mcap_source.py).
+#
+# rosbag2 embeds each message's schema in the .mcap file, so these packages
+# decode CDR messages standalone — no ROS installation, no sourcing a workspace.
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install -r requirements-mcap.txt
+#
+# Then:
+#   python src/stairs_pipeline.py --list /path/to/bag/folder
+
+mcap
+mcap-ros2-support
