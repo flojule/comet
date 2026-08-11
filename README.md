@@ -57,8 +57,23 @@ For the SAM 3 backend only (see [SAM 3 tracking](#sam-3-tracking-track_sam3py)):
 ```bash
 pip install -r requirements-sam3.txt
 git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
-python src/sam3_preflight.py     # verifies python/torch/CUDA/sam3
+python src/sam3_preflight.py     # verifies python/torch/CUDA/sam3/weights
 ```
+
+**Weights.** `track_sam3.py` looks for a local checkpoint in this order:
+
+1. `--checkpoint /path/to/sam3.pt`
+2. `$COMET_SAM3_CHECKPOINT`
+3. `~/ws/models/weights/sam3.pt`, `~/ws/models/weights/sam3.1.pt`,
+   `models/weights/sam3.pt`
+
+A local file is passed straight to the builder as `checkpoint_path`, which
+skips its `load_from_HF` default — so with weights on disk you need no Hugging
+Face account at all. Only if nothing is found does SAM 3 fall back to
+downloading the gated `facebook/sam3` checkpoint, which requires
+[requesting access](https://huggingface.co/facebook/sam3) and
+`huggingface-cli login`. A `--checkpoint` or `$COMET_SAM3_CHECKPOINT` that
+points at a missing file is an error, not a silent fallback to the download.
 
 ## Usage
 
@@ -139,6 +154,8 @@ python src/track_sam3.py --text "drone" --name 0=cf1 --name 1=cf2
 | `--borrow-agents payload --borrow-from <json>` | take that agent from another tracker's output |
 | `--save-masks` | write a `*_masks.npz` sidecar for mask-aware rendering |
 | `--no-gap-fill` | leave dropouts as holes instead of interpolating |
+| `--checkpoint PATH` | weights file (see [Setup](#setup) for the search order) |
+| `--gpus 0,1` | restrict which CUDA devices are used |
 
 **Quality reporting.** Every run logs per-object coverage, longest dropout,
 score range and mask area, and stores them under `sam3_stats` in the tracking

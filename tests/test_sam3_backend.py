@@ -11,10 +11,12 @@ verify SAM 3's tracking quality; that needs a GPU and the real checkpoint.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -27,6 +29,7 @@ from fake_sam3 import FakePredictor                         # noqa: E402
 
 from maskstore import MaskStore, decode_rle, encode_rle, sidecar_path   # noqa: E402
 from sam3_backend import (                                  # noqa: E402
+    CHECKPOINT_ENV,
     FrameWindow,
     Observation,
     PromptSpec,
@@ -36,6 +39,7 @@ from sam3_backend import (                                  # noqa: E402
     mask_to_observation,
     normalize_frame_outputs,
     observations_to_trails,
+    resolve_checkpoint,
     track_window,
     track_window_chunked,
 )
@@ -572,6 +576,58 @@ class TestTrackingJsonContract(unittest.TestCase):
 
 
 # ── Mask store ─────────────────────────────────────────────────────────────────
+
+class TestResolveCheckpoint(unittest.TestCase):
+    """Weights lookup: explicit path, then $COMET_SAM3_CHECKPOINT, then defaults."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ckpt = Path(self.tmp.name) / "sam3.pt"
+        self.ckpt.write_bytes(b"weights")
+        self._env = os.environ.pop(CHECKPOINT_ENV, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        os.environ.pop(CHECKPOINT_ENV, None)
+        if self._env is not None:
+            os.environ[CHECKPOINT_ENV] = self._env
+
+    def test_explicit_path_wins(self):
+        other = Path(self.tmp.name) / "other.pt"
+        other.write_bytes(b"w")
+        os.environ[CHECKPOINT_ENV] = str(other)
+        self.assertEqual(resolve_checkpoint(str(self.ckpt)), str(self.ckpt))
+
+    def test_env_var_used_when_no_explicit_path(self):
+        os.environ[CHECKPOINT_ENV] = str(self.ckpt)
+        self.assertEqual(resolve_checkpoint(), str(self.ckpt))
+
+    def test_tilde_is_expanded(self):
+        os.environ[CHECKPOINT_ENV] = str(self.ckpt).replace(
+            str(Path.home()), "~", 1)
+        if os.environ[CHECKPOINT_ENV].startswith("~"):
+            self.assertEqual(resolve_checkpoint(), str(self.ckpt))
+
+    def test_missing_explicit_path_raises_instead_of_downloading(self):
+        # A typo must not silently trigger an 800 MB gated download.
+        with self.assertRaises(FileNotFoundError):
+            resolve_checkpoint(str(Path(self.tmp.name) / "nope.pt"))
+
+    def test_missing_env_path_raises(self):
+        os.environ[CHECKPOINT_ENV] = str(Path(self.tmp.name) / "nope.pt")
+        with self.assertRaises(FileNotFoundError):
+            resolve_checkpoint()
+
+    def test_none_when_nothing_found(self):
+        with mock.patch("sam3_backend.DEFAULT_CHECKPOINT_PATHS",
+                        (str(Path(self.tmp.name) / "absent.pt"),)):
+            self.assertIsNone(resolve_checkpoint())
+
+    def test_falls_back_to_default_search_paths(self):
+        with mock.patch("sam3_backend.DEFAULT_CHECKPOINT_PATHS",
+                        ("/definitely/absent.pt", str(self.ckpt))):
+            self.assertEqual(resolve_checkpoint(), str(self.ckpt))
+
 
 class TestMaskStore(unittest.TestCase):
     def test_rle_roundtrip(self):

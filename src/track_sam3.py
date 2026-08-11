@@ -302,6 +302,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--frames-dir", default=None,
                    help="keep extracted frames here instead of a temp dir")
     p.add_argument("--gpus", default=None, help="comma-separated CUDA device ids")
+    p.add_argument("--checkpoint", default=None, metavar="PATH",
+                   help="SAM 3 weights file. Defaults to $COMET_SAM3_CHECKPOINT, "
+                        "then ~/ws/models/weights/sam3.pt; if none is found, "
+                        "upstream downloads the gated checkpoint from HF")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -358,6 +362,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         chunk_size       = max(0, args.reprompt_every),
         chunk_overlap    = args.chunk_overlap,
         gpus             = [int(g) for g in _split(args.gpus)] or None,
+        checkpoint       = args.checkpoint,
         keep_masks       = want_masks,
     )
 

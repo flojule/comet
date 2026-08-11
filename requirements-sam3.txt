@@ -11,8 +11,11 @@
 #   pip install -r requirements-sam3.txt
 #   git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
 #
-# The SAM 3 checkpoints are gated: request access at
-# https://huggingface.co/facebook/sam3, then `huggingface-cli login`.
+# Weights: point --checkpoint or $COMET_SAM3_CHECKPOINT at a local sam3.pt (also
+# found automatically at ~/ws/models/weights/sam3.pt).  With a local file no
+# Hugging Face account is needed; without one, SAM 3 downloads the gated
+# facebook/sam3 checkpoint, which needs an access request and
+# `huggingface-cli login` — huggingface_hub below is only for that path.
 #
 # Verify the whole setup with:
 #   python src/sam3_preflight.py

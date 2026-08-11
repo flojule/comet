@@ -13,6 +13,18 @@ import importlib
 import platform
 import shutil
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from sam3_backend import (
+        CHECKPOINT_ENV, DEFAULT_CHECKPOINT_PATHS, resolve_checkpoint,
+    )
+except ImportError:
+    # numpy/cv2 missing — check_pipeline_deps() reports that as the real fault.
+    CHECKPOINT_ENV = "COMET_SAM3_CHECKPOINT"
+    DEFAULT_CHECKPOINT_PATHS = ()
+    resolve_checkpoint = None
 
 # (label, minimum) — from the upstream SAM 3 README.
 MIN_PYTHON = (3, 12)
@@ -87,6 +99,30 @@ def check_sam3() -> bool:
     return True
 
 
+def check_checkpoint() -> bool:
+    """Locate the weights file.  Not fatal — upstream can download instead."""
+    if resolve_checkpoint is None:
+        _line(WARN, "checkpoint", "skipped — pipeline deps missing")
+        return True
+
+    try:
+        ckpt = resolve_checkpoint()
+    except FileNotFoundError as e:
+        _line(FAIL, "checkpoint", str(e))
+        return False
+
+    if ckpt:
+        gb = Path(ckpt).stat().st_size / 1024 ** 3
+        _line(OK, "checkpoint", f"{ckpt} ({gb:.2f} GB)")
+        return True
+
+    searched = ", ".join(DEFAULT_CHECKPOINT_PATHS)
+    _line(WARN, "checkpoint",
+          f"no local weights (looked at ${CHECKPOINT_ENV}, then {searched}); "
+          f"SAM 3 will download the gated checkpoint from Hugging Face")
+    return True
+
+
 def check_pipeline_deps() -> bool:
     ok = True
     for mod in ("cv2", "numpy", "scipy"):
@@ -108,14 +144,17 @@ def main() -> int:
         check_pipeline_deps(),
         check_torch(),
         check_sam3(),
+        check_checkpoint(),
     ]
     print()
     if all(results):
         print("All checks passed — `python src/track_sam3.py` should run.")
         return 0
     print("Preflight failed. Fix the FAIL lines above, then re-run.")
-    print("Note: SAM 3 checkpoints are gated on Hugging Face — request access at")
-    print("      https://huggingface.co/facebook/sam3 and `huggingface-cli login`.")
+    print("If you have no local weights file, SAM 3 downloads a gated checkpoint:")
+    print("  request access at https://huggingface.co/facebook/sam3, then")
+    print("  `huggingface-cli login`.  A local file avoids this entirely — point")
+    print(f"  ${CHECKPOINT_ENV} or --checkpoint at it.")
     return 1
 
 

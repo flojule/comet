@@ -33,6 +33,7 @@ the pipeline (and the test suite) still runs on a machine without them.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -46,6 +47,47 @@ import numpy as np
 
 # Candidate keyword names for a box prompt, tried in order until one is accepted.
 BOX_PROMPT_KEYS: tuple[str, ...] = ("box", "boxes", "bbox", "input_boxes")
+
+# Where to look for a local SAM 3 checkpoint, in order.  Upstream's builder
+# defaults to `load_from_HF=True`, which downloads the gated facebook/sam3
+# checkpoint; passing `checkpoint_path` skips that entirely, so a local weights
+# file means no Hugging Face account or access request is needed.
+CHECKPOINT_ENV = "COMET_SAM3_CHECKPOINT"
+DEFAULT_CHECKPOINT_PATHS: tuple[str, ...] = (
+    "~/ws/models/weights/sam3.pt",
+    "~/ws/models/weights/sam3.1.pt",
+    "models/weights/sam3.pt",
+)
+
+
+def resolve_checkpoint(explicit: str | None = None) -> str | None:
+    """Find the SAM 3 weights file: explicit path, then env var, then defaults.
+
+    Returns None when nothing is found, which leaves upstream to download from
+    Hugging Face.  An explicit path that does not exist is an error rather than
+    a silent fallback — quietly downloading 800 MB because of a typo is worse
+    than failing.
+    """
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"SAM 3 checkpoint not found: {p}")
+        return str(p)
+
+    env = os.environ.get(CHECKPOINT_ENV)
+    if env:
+        p = Path(env).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(
+                f"{CHECKPOINT_ENV} points at a missing file: {p}"
+            )
+        return str(p)
+
+    for cand in DEFAULT_CHECKPOINT_PATHS:
+        p = Path(cand).expanduser()
+        if p.is_file():
+            return str(p)
+    return None
 
 # Keys searched when pulling masks / ids / scores out of a frame's outputs.
 _MASK_KEYS  = ("pred_masks", "masks", "mask", "pred_mask", "masklets")
@@ -86,6 +128,7 @@ class Sam3Config:
 
     # Runtime
     gpus: list[int] | None = None    # None = every visible CUDA device
+    checkpoint: str | None = None    # local weights; None = search, then HF
     keep_masks: bool = False         # decode full masks at all
     # Called as sink(absolute_frame, obj_id, mask) for every mask, which is then
     # dropped from the Observation.  Masks are big — a 1080p boolean mask is
@@ -562,8 +605,24 @@ def build_predictor(cfg: Sam3Config):
         )
 
     gpus = cfg.gpus if cfg.gpus is not None else list(range(torch.cuda.device_count()))
+    kwargs = dict(cfg.extra_builder_kwargs)
+
+    # build_sam3_video_predictor(*args, gpus_to_use=None, **model_kwargs) forwards
+    # model_kwargs down to build_sam3_video_model, whose `checkpoint_path` short
+    # circuits its `load_from_HF=True` default.
+    ckpt = resolve_checkpoint(cfg.checkpoint)
+    if ckpt:
+        kwargs.setdefault("checkpoint_path", ckpt)
+        logging.info(f"SAM 3 checkpoint: {ckpt}")
+    else:
+        logging.info(
+            "No local SAM 3 checkpoint found "
+            f"(set {CHECKPOINT_ENV} or --checkpoint); "
+            "falling back to the gated Hugging Face download"
+        )
+
     logging.info(f"Building SAM 3 video predictor on GPUs {gpus}")
-    return build_sam3_video_predictor(gpus_to_use=gpus, **cfg.extra_builder_kwargs)
+    return build_sam3_video_predictor(gpus_to_use=gpus, **kwargs)
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────────
