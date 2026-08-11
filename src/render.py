@@ -9,8 +9,8 @@ Outputs (MP4, next to the JSON file):
     <stem>_persistent.mp4
     <stem>_transient.mp4
 
-Any trail property can be overridden via the RENDER_* env vars or by editing
-the OVERRIDES dict at the top of this file.
+Any trail property can be overridden on the command line (see --help) or by
+editing the OVERRIDES dict at the top of this file.
 
 Mask modes (need a *_masks.npz sidecar, written by
 `track_sam3.py --save-masks`; ignored when there is none):
@@ -96,12 +96,16 @@ def load_masks(data_file: str, want: bool) -> MaskStore | None:
     return store
 
 
-def render(data_file: str = DEFAULT_DATA_FILE, mask_mode: str = "off") -> None:
+def render(data_file: str = DEFAULT_DATA_FILE, mask_mode: str = "off",
+           overrides: dict | None = None) -> None:
     with open(data_file) as f:
         d = json.load(f)
 
-    # Apply overrides
+    # File-level overrides first, then per-run ones from the command line.
     for k, v in OVERRIDES.items():
+        if v is not None:
+            d[k] = v
+    for k, v in (overrides or {}).items():
         if v is not None:
             d[k] = v
 
@@ -241,9 +245,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mask-mode", choices=("off", "occlude", "glow"), default="off",
                    help="use the *_masks.npz sidecar to composite objects over "
                         "the trails (default: off)")
+    p.add_argument("--thickness", type=int, default=None, help="trail line width")
+    p.add_argument("--alpha", type=float, default=None,
+                   help="trail opacity, 0-1")
+    p.add_argument("--trail-window", type=int, default=None,
+                   help="frames kept in the transient trail")
+    p.add_argument("--smooth", dest="smooth", action="store_true", default=None,
+                   help="smooth trails (default: as recorded)")
+    p.add_argument("--no-smooth", dest="smooth", action="store_false",
+                   help="draw raw tracked points")
+    p.add_argument("--color", action="append", default=[], metavar="NAME=B,G,R",
+                   help="override one trail colour; repeat per object")
+    p.add_argument("--trail-start-sec", type=float, default=None)
+    p.add_argument("--trail-end-sec", type=float, default=None)
     return p.parse_args(argv)
+
+
+def overrides_from_args(args: argparse.Namespace, data_file: str) -> dict:
+    """CLI flags → the same keys the tracking JSON uses."""
+    out = {
+        "trail_thickness": args.thickness,
+        "alpha": args.alpha,
+        "trail_window": args.trail_window,
+        "smooth_trails": args.smooth,
+        "trail_start_sec": args.trail_start_sec,
+        "trail_end_sec": args.trail_end_sec,
+    }
+    if args.color:
+        with open(data_file) as f:
+            colors = dict(json.load(f).get("trail_color", {}))
+        for spec in args.color:
+            if "=" not in spec:
+                raise SystemExit(f"--color wants NAME=B,G,R, got {spec!r}")
+            name, _, nums = spec.partition("=")
+            parts = [p.strip() for p in nums.split(",")]
+            if len(parts) != 3:
+                raise SystemExit(f"--color {name}: expected 3 numbers B,G,R")
+            colors[name.strip()] = [int(p) for p in parts]
+        out["trail_color"] = colors
+    return out
 
 
 if __name__ == "__main__":
     _a = parse_args()
-    render(_a.data_file, _a.mask_mode)
+    render(_a.data_file, _a.mask_mode, overrides_from_args(_a, _a.data_file))
