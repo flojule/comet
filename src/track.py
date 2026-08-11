@@ -3,6 +3,7 @@
 """Track objects using foreground detection + global Hungarian assignment."""
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import subprocess
@@ -13,9 +14,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from scipy.interpolate import UnivariateSpline
 from scipy.optimize import linear_sum_assignment as _scipy_lsa
-from scipy.signal import savgol_filter
+
+from trails import (
+    blend_trail,
+    box_center,
+    build_tracking_data,
+    smooth_pts,
+    write_tracking_json,
+)
+from trails import safe_append as _safe_append
 
 
 def _hungarian(cost: np.ndarray) -> list[tuple[int, int]]:
@@ -73,25 +81,9 @@ CLAMP_WHEN_LOST: set[str] = {"payload"}
 
 # ── Pure helpers ───────────────────────────────────────────────────────────────
 
-def box_center(x: int, y: int, w: int, h: int) -> tuple[int, int]:
-    return x + w // 2, y + h // 2
-
-
-def blend_trail(frame: np.ndarray, canvas: np.ndarray, alpha: float) -> np.ndarray:
-    mask = canvas.any(axis=2)
-    out  = frame.copy()
-    out[mask] = cv2.addWeighted(frame, 1 - alpha, canvas, alpha, 0)[mask]
-    return out
-
-
 def safe_append(trail: list, pt: tuple[int, int]) -> None:
-    if not trail:
-        trail.append(pt)
-        return
-    lx, ly = trail[-1]
-    if ((lx - pt[0]) ** 2 + (ly - pt[1]) ** 2) ** 0.5 > JUMP_THRESHOLD:
-        return
-    trail.append(pt)
+    """Module-local binding of the shared helper at this tracker's threshold."""
+    _safe_append(trail, pt, JUMP_THRESHOLD)
 
 
 def estimate_velocity(trail: list) -> tuple[float, float]:
@@ -361,110 +353,6 @@ def _replay_trail(
         logging.debug(f"Gap-fill: {name} interpolated {n} frames (only {len(sub)} detections found)")
 
 
-def _fill_gaps_bidirectional(
-    full_trail_log:      dict[str, dict[int, tuple[int, int]]],
-    full_det_log:        dict[int, list],
-    corridor_half_width: float = 80.0,
-    min_gap_frames:      int   = 5,
-    y_bands:             dict[str, tuple[float, float]] | None = None,
-) -> dict[str, dict[int, tuple[int, int]]]:
-    """
-    Post-process gap fill using both the gap start and end positions.
-
-    For each gap of ≥ min_gap_frames consecutive missing frames in an agent's
-    trail, we:
-      1. Define a corridor: points within `corridor_half_width` px of the
-         straight line between the gap's anchor and recovery positions.
-      2. For every gap frame, pick the nearest detection inside that corridor.
-      3. If ≥ 25 % of gap frames found a detection, use them (+ linear interp
-         for the remainder).  Otherwise fall back to pure linear interpolation.
-
-    Returns a dict {agent_name: {frame_idx: (cx, cy)}} that covers all frames
-    from the first to last tracked frame, gaps filled in.
-    """
-    result: dict[str, dict[int, tuple[int, int]]] = {}
-    for name, frame_pts in full_trail_log.items():
-        if not frame_pts:
-            result[name] = {}
-            continue
-
-        frames = sorted(frame_pts.keys())
-        filled: dict[int, tuple[int, int]] = dict(frame_pts)
-
-        for i in range(len(frames) - 1):
-            fa = frames[i]
-            fb = frames[i + 1]
-            gap_len = fb - fa - 1
-            if gap_len < min_gap_frames:
-                continue
-
-            start_pt = frame_pts[fa]
-            end_pt   = frame_pts[fb]
-            sx, sy   = start_pt
-            ex, ey   = end_pt
-            seg_dx   = ex - sx
-            seg_dy   = ey - sy
-            seg_len2 = seg_dx ** 2 + seg_dy ** 2
-
-            sub: dict[int, tuple[int, int]] = {}
-            y_lo, y_hi = (y_bands[name] if y_bands and name in y_bands
-                          else (-float("inf"), float("inf")))
-            for gf in range(fa + 1, fb):
-                dets    = full_det_log.get(gf, [])
-                best_d  = float("inf")
-                best_pt: tuple[int, int] | None = None
-                for dx, dy, dw, dh in dets:
-                    dcx = dx + dw / 2
-                    dcy = dy + dh / 2
-                    if not (y_lo <= dcy <= y_hi):
-                        continue
-                    # Perpendicular distance from detection to line segment
-                    if seg_len2 < 1.0:
-                        d_line = ((dcx - sx) ** 2 + (dcy - sy) ** 2) ** 0.5
-                    else:
-                        t = ((dcx - sx) * seg_dx + (dcy - sy) * seg_dy) / seg_len2
-                        t = max(0.0, min(1.0, t))
-                        d_line = ((dcx - (sx + t * seg_dx)) ** 2
-                                  + (dcy - (sy + t * seg_dy)) ** 2) ** 0.5
-                    if d_line < corridor_half_width and d_line < best_d:
-                        best_d  = d_line
-                        best_pt = (int(dcx), int(dcy))
-                if best_pt:
-                    sub[gf] = best_pt
-
-            gap_frames = list(range(fa + 1, fb))
-            if len(sub) >= max(1, len(gap_frames) * 0.25):
-                for gf in gap_frames:
-                    if gf in sub:
-                        filled[gf] = sub[gf]
-                    else:
-                        t = (gf - fa) / (fb - fa)
-                        filled[gf] = (int(sx + seg_dx * t), int(sy + seg_dy * t))
-            else:
-                for gf in gap_frames:
-                    t = (gf - fa) / (fb - fa)
-                    filled[gf] = (int(sx + seg_dx * t), int(sy + seg_dy * t))
-
-            logging.debug(
-                f"Gap-fill {name}: {fa}→{fb} ({gap_len} frames), "
-                f"det hits={len(sub)}/{len(gap_frames)}"
-            )
-
-        result[name] = filled
-    return result
-
-
-def smooth_pts(pts: list) -> list:
-    """Savitzky-Golay smooth for real-time trail rendering."""
-    n = len(pts)
-    if n < 5:
-        return list(pts)
-    win = min(15, n if n % 2 == 1 else n - 1)  # odd, <= n, >= 5
-    xs = savgol_filter([p[0] for p in pts], win, 3)
-    ys = savgol_filter([p[1] for p in pts], win, 3)
-    return [(int(x), int(y)) for x, y in zip(xs, ys)]
-
-
 def render_trails(canvas: np.ndarray, trails: dict[str, list], show: bool) -> None:
     if not show:
         return
@@ -520,40 +408,25 @@ def draw_debug(
     return out
 
 
-def spline_smooth(pts: list) -> list:
-    """
-    Global smoothing spline fitted to the full trail.
-    Used in post-processing where the complete trajectory is known.
-    UnivariateSpline (s > 0) does not interpolate exactly — it finds a smooth
-    curve that minimises squared residuals, which is exactly what we want for
-    noisy tracking data.
-    """
-    n = len(pts)
-    if n < 4:
-        return list(pts)
-    t    = np.arange(n, dtype=float)
-    xs   = np.array([p[0] for p in pts], dtype=float)
-    ys   = np.array([p[1] for p in pts], dtype=float)
-    s    = n * 4.0   # smoothing factor — larger → smoother curve
-    sp_x = UnivariateSpline(t, xs, s=s, k=3)
-    sp_y = UnivariateSpline(t, ys, s=s, k=3)
-    return [(int(float(sp_x(ti))), int(float(sp_y(ti)))) for ti in t]
-
-
-def filter_trail(trail: list, max_dev: int = 120) -> list:
-    if not trail:
-        return []
-    out = [trail[0]]
-    for p in trail[1:]:
-        lx, ly = out[-1]
-        if ((p[0] - lx) ** 2 + (p[1] - ly) ** 2) ** 0.5 <= max_dev:
-            out.append(p)
-    return out
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--no-display", action="store_true",
+                   help="run without a GUI window (required on headless machines)")
+    p.add_argument("--video", default=VIDEO_IN, help=f"input video (default: {VIDEO_IN})")
+    p.add_argument("--rois", default=ROIS_FILE, help=f"ROI file (default: {ROIS_FILE})")
+    p.add_argument("--out", default=VIDEO_OUT, help=f"output path stem (default: {VIDEO_OUT})")
+    return p.parse_args(argv)
+
+
+def main(args: argparse.Namespace | None = None) -> None:
+    args = args or parse_args([])
+    video_in  = args.video
+    rois_file = args.rois
+    video_out = args.out
+    display   = not args.no_display
+
     # ── Logging ────────────────────────────────────────────────────────────────
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if LOG_TO_FILE:
@@ -564,22 +437,22 @@ def main() -> None:
     )
 
     # ── Load ROIs ──────────────────────────────────────────────────────────────
-    with open(ROIS_FILE) as f:
+    with open(rois_file) as f:
         raw = json.load(f)
     start_frame: int       = raw.get("start_frame", 0)   if isinstance(raw, dict) else 0
     end_frame:   int | None = raw.get("end_frame",   None) if isinstance(raw, dict) else None
     rois: dict              = raw["rois"] if isinstance(raw, dict) and "rois" in raw else raw
 
     # ── Optional input re-encode ───────────────────────────────────────────────
-    proc_video = VIDEO_IN
+    proc_video = video_in
     temp_mp4   = None
-    if not VIDEO_IN.lower().endswith(".mp4"):
+    if not video_in.lower().endswith(".mp4"):
         try:
             tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             temp_mp4 = tmpf.name
             tmpf.close()
             r = subprocess.run(
-                ["ffmpeg", "-y", "-i", VIDEO_IN,
+                ["ffmpeg", "-y", "-i", video_in,
                  "-c:v", "libx264", "-crf", "18", "-preset", "fast", temp_mp4],
                 capture_output=True, timeout=300,
             )
@@ -626,7 +499,7 @@ def main() -> None:
     logging.debug("Background model built")
 
     # ── Save debug background images ────────────────────────────────────────────
-    dbg_dir = Path(VIDEO_OUT).parent
+    dbg_dir = Path(video_out).parent
     cv2.imwrite(str(dbg_dir / "debug_background.png"), bg_img)
     cv2.imwrite(str(dbg_dir / "debug_first_frame.png"), first_frame)
     # Foreground mask at start_frame — shows exactly which blobs the detector fires on
@@ -681,12 +554,13 @@ def main() -> None:
     full_trail_log: dict[str, dict[int, tuple[int, int]]] = {n: {} for n in states}
 
     frame_idx = start_frame + 1
-    cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Tracking", 1600, 900)
+    if display:
+        cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Tracking", 1600, 900)
     logging.debug(f"Tracking frames {start_frame}→{end_frame or total - 1}")
 
     # Debug writer covers only the tracked segment (start_frame → end_frame)
-    debug_out    = str(Path(VIDEO_OUT).with_name(Path(VIDEO_OUT).stem + "_debug.mp4"))
+    debug_out    = str(Path(video_out).with_name(Path(video_out).stem + "_debug.mp4"))
     debug_writer = cv2.VideoWriter(debug_out, fourcc_mp4, fps_v, (W, H))
 
     while True:
@@ -878,10 +752,11 @@ def main() -> None:
         annotated = blend_trail(frame, trail_canvas, ALPHA) if show_trail else frame.copy()
         dbg = draw_debug(annotated, states, frame_idx, total, fps_v)
         debug_writer.write(dbg)
-        cv2.imshow("Tracking", dbg)
-        if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-            logging.info("Quit early")
-            break
+        if display:
+            cv2.imshow("Tracking", dbg)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                logging.info("Quit early")
+                break
 
         if frame_idx % 30 == 0:
             sys.stdout.write(f"\r  tracking {100 * frame_idx / total:.0f}%")
@@ -894,7 +769,8 @@ def main() -> None:
 
     cap.release()
     debug_writer.release()
-    cv2.destroyAllWindows()
+    if display:
+        cv2.destroyAllWindows()
     logging.info(f"Debug → {debug_out}")
 
     # ── Temp cleanup ───────────────────────────────────────────────────────────
@@ -905,31 +781,27 @@ def main() -> None:
             pass
 
     # ── Export tracking data for post-processing ───────────────────────────────
-    data_out = str(Path(VIDEO_OUT).with_name(Path(VIDEO_OUT).stem + "_tracking.json"))
-    tracking_data = {
-        "video_in":        VIDEO_IN,
-        "fps":             fps_v,
-        "total_frames":    total,
-        "width":           W,
-        "height":          H,
-        "start_frame":     start_frame,
-        "end_frame":       end_frame,
-        "trail_start_sec": trail_start_sec,
-        "trail_end_sec":   trail_end_sec,
-        "trail_color":     {k: list(v) for k, v in TRAIL_COLOR.items()},
-        "trail_thickness": TRAIL_THICKNESS,
-        "alpha":           ALPHA,
-        "trail_window":    TRAIL_WINDOW,
-        "smooth_trails":   SMOOTH_TRAILS,
-        "trails": {
-            name: {str(fi): list(pt) for fi, pt in fd.items()}
-            for name, fd in full_trail_log.items()
-        },
-    }
-    with open(data_out, "w") as f:
-        json.dump(tracking_data, f)
+    data_out = str(Path(video_out).with_name(Path(video_out).stem + "_tracking.json"))
+    tracking_data = build_tracking_data(
+        video_in        = video_in,
+        fps             = fps_v,
+        total_frames    = total,
+        width           = W,
+        height          = H,
+        start_frame     = start_frame,
+        end_frame       = end_frame,
+        trail_start_sec = trail_start_sec,
+        trail_end_sec   = trail_end_sec,
+        trail_color     = TRAIL_COLOR,
+        trail_thickness = TRAIL_THICKNESS,
+        alpha           = ALPHA,
+        trail_window    = TRAIL_WINDOW,
+        smooth_trails   = SMOOTH_TRAILS,
+        trails          = full_trail_log,
+    )
+    write_tracking_json(data_out, tracking_data)
     logging.info(f"Tracking data → {data_out}")
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())
